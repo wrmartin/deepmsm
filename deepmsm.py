@@ -11,8 +11,67 @@ from deeptime.base import Model, Transformer
 from deeptime.base_torch import DLEstimatorMixin
 from deeptime.util.torch import map_data
 from deeptime.markov.tools.analysis import pcca_memberships
-
+from args import buildParser
+args = buildParser().parse_args()
+outfolder = args.isoform + '_' + args.save_folder
 CLIP_VALUE = 1.
+
+from deeptime.util.platform import handle_progress_bar
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.npz', trace_func=print, minscore=1):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            verbose (bool): If True, prints a message for each validation loss improvement. 
+                            Default: False
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+            path (str): Path for the checkpoint to be saved to.
+                            Default: 'checkpoint.pt'
+            trace_func (function): trace print function.
+                            Default: print            
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.path = path
+        self.trace_func = trace_func
+        self.minscore = minscore
+    def __call__(self, val_loss, model):
+
+        score = val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if (self.counter >= self.patience) and (self.best_score >= self.minscore):
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decrease.'''
+        if self.verbose:
+            self.trace_func(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        list_dict = model.state_dict()
+        
+        np.savez(self.path, 
+        dict_lobe=list_dict[0],
+        dict_u=list_dict[1],
+        dict_s=list_dict[2],
+                *list_dict[3:])
+        self.val_loss_min = val_loss
 
 def symeig_reg(mat, epsilon: float = 1e-6, mode='regularize', eigenvectors=True) \
         -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -43,7 +102,7 @@ def symeig_reg(mat, epsilon: float = 1e-6, mode='regularize', eigenvectors=True)
         mat = mat + epsilon * identity
 
     # Calculate eigvalues and potentially eigvectors
-    eigval, eigvec = torch.symeig(mat, eigenvectors=True)
+    eigval, eigvec = torch.linalg.eigh(mat, UPLO='U')
 
     if eigenvectors:
         eigvec = eigvec.transpose(0, 1)
@@ -610,7 +669,7 @@ def get_process_eigval(S, Sigma, state1, state2, epsilon=1e-6, mode='regularize'
     
     S_similar = Sigma_sqrt @ S @ Sigma_sqrt
 
-    eigval_all, eigvec_all = torch.symeig(S_similar, eigenvectors=True)
+    eigval_all, eigvec_all = torch.linalg.eigh(S_similar, eigenvectors=True)
     eigvecs_K = Sigma_sqrt_inv @ eigvec_all
 
     # Find the relevant process which is changing most between state1 and state2
@@ -719,12 +778,20 @@ class DeepMSMModel(Transformer, Model):
             mu = self._ulayer(x_t, x_t, return_mu=True)[-1] # use dummy x_0
         return mu.detach().to('cpu').numpy()
     
-    def get_transition_matrix(self, data_0, data_t):
+    def get_transition_matrix(self, data_loader: torch.utils.data.DataLoader, progress=None):
+        progress = handle_progress_bar(progress)
         self._lobe.eval()
         net = self._lobe
+        x_0=torch.Tensor()
+        x_0=x_0.to(self._device)
+        x_t=torch.Tensor()
+        x_t=x_t.to(self._device)
         with torch.no_grad():
-            x_0 = net(self.mask(torch.Tensor(data_0).to(self._device)))
-            x_t = net(self.mask(torch.Tensor(data_t).to(self._device)))
+            for batch_0, batch_t in progress(data_loader, desc="Getting Transition Matrix"):
+                x_0_tmp = net(self.mask(torch.Tensor(batch_0).to(self._device)))
+                x_0=torch.cat((x_0,x_0_tmp),0)
+                x_t_tmp = net(self.mask(torch.Tensor(batch_t).to(self._device)))
+                x_t=torch.cat((x_t,x_t_tmp),0)
             _, K = vampe_loss_rev(x_0, x_t, self._ulayer, self._slayer, return_K=True)
             
         K = K.to('cpu').numpy().astype('float64') 
@@ -1131,7 +1198,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
             train_mode='all', mask=False,
             train_score_callback: Callable[[int, torch.Tensor], None] = None,
             validation_score_callback: Callable[[int, torch.Tensor], None] = None,
-            tb_writer=None, **kwargs):
+            tb_writer=None, progress=None, **kwargs):
         r""" Fits a VampNet on data.
 
         Parameters
@@ -1162,11 +1229,13 @@ class DeepMSM(DLEstimatorMixin, Transformer):
         self : VAMPNet
             Reference to self.
         """
-        self._step = 0        
+        progress = handle_progress_bar(progress)
+        if self._step == None:
+            self._step = 0
         
         # and train
         if train_mode=='all':
-            for epoch in range(n_epochs):
+            for _ in progress(range(n_epochs), desc="Fitting deepmsm", total=n_epochs):
                 for batch_0, batch_t in data_loader:
                     self.partial_fit((batch_0, batch_t), mask=mask,
                                      train_score_callback=train_score_callback, tb_writer=tb_writer)
@@ -1187,20 +1256,20 @@ class DeepMSM(DLEstimatorMixin, Transformer):
         else:
             chi_t, chi_tau = [], []
             with torch.no_grad():
-                for batch_0, batch_t in data_loader:
+                for batch_0, batch_t in progress(data_loader, desc="Training {}".format(train_mode)):
                     chi_t.append(self.forward(batch_0).detach())
                     chi_tau.append(self.forward(batch_t).detach())
                 x_0 = torch.cat(chi_t, dim=0)
                 x_t = torch.cat(chi_tau, dim=0)
                 if validation_loader is not None:
                     chi_val_t, chi_val_tau = [], []
-                    for batch_0, batch_t in validation_loader:
+                    for batch_0, batch_t in progress(validation_loader, desc="Validating {}".format(train_mode)):
                         chi_val_t.append(self.forward(batch_0).detach())
                         chi_val_tau.append(self.forward(batch_t).detach())
                     x_val_0 = torch.cat(chi_val_t, dim=0)
                     x_val_t = torch.cat(chi_val_tau, dim=0)
             if train_mode=='us' or train_mode=='u':
-                for epoch in range(n_epochs):
+                for _ in progress(range(n_epochs), desc="Optimizing {}".format(train_mode), total=n_epochs):
                     self.optimizer_u.zero_grad()
                     if train_mode=='us':
                         self.optimizer_s.zero_grad()
@@ -1233,7 +1302,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
                 with torch.no_grad():
                     v, C_00, C_11, C_01, Sigma = self.ulayer(x_0, x_t)
                     v_val, C_00_val, C_11_val, C_01_val, Sigma_val = self.ulayer(x_val_0, x_val_t)
-                for epoch in range(n_epochs):
+                for _ in progress(range(n_epochs), desc="Optimizing {}".format(train_mode), total=n_epochs):
                     self.optimizer_s.zero_grad()
                     
                     loss_value = -vampe_loss_rev_only_S(v, C_00, C_11, C_01, Sigma, self.slayer)[0]
@@ -1264,7 +1333,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
     def fit_routine(self, data_loader: torch.utils.data.DataLoader, n_epochs=1, validation_loader=None,
             rel=1e-4, reset_u=False, max_iter=100, mask=False,
             train_score_callback: Callable[[int, torch.Tensor], None] = None,
-            validation_score_callback: Callable[[int, torch.Tensor], None] = None, tb_writer=None, **kwargs):
+            validation_score_callback: Callable[[int, torch.Tensor], None] = None, tb_writer=None, progress=None, **kwargs):
         r""" Fits a VampNet on data.
 
         Parameters
@@ -1295,8 +1364,10 @@ class DeepMSM(DLEstimatorMixin, Transformer):
         self : VAMPNet
             Reference to self.
         """
-        self._step = 0
-        
+        progress = handle_progress_bar(progress)
+        if self._step == None:
+            self._step = 0
+        early_stopping = EarlyStopping(patience=4, verbose=True, delta=0.001, minscore=args.num_classes-0.05, path=outfolder+'/deep_es_check_{}'.format(args.num_classes))
         # and train
         for g in self.optimizer_lobe.param_groups:
             lr_chi = g['lr']
@@ -1309,7 +1380,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
             lr_u = g['lr']
         for g in self.optimizer_s.param_groups:
             lr_s = g['lr']                
-        for epoch in range(n_epochs):
+        for _ in progress(range(n_epochs), desc="Fitting deepmsm", total=n_epochs):
             for g in self.optimizer_u.param_groups:
                 g['lr'] = lr_u/10
             for g in self.optimizer_s.param_groups:
@@ -1394,7 +1465,12 @@ class DeepMSM(DLEstimatorMixin, Transformer):
                         tb_writer.add_scalars('Loss', {'valid': mean_score.item()}, self._step)
                         tb_writer.add_scalars('VAMPE', {'valid': -mean_score.item()}, self._step)
                     if validation_score_callback is not None:
-                        validation_score_callback(self._step, mean_score)                                
+                        validation_score_callback(self._step, mean_score)     
+            early_stopping(mean_score.item(), self)
+
+            if early_stopping.early_stop:
+                print("Early Stop!")
+                break                           
         for g in self.optimizer_lobe.param_groups:
             g['lr'] = lr_chi   
         if self.optimizer_mask is not None:
@@ -1405,7 +1481,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
     def fit_cg(self, data_loader: torch.utils.data.DataLoader, n_epochs=1, validation_loader=None,
             train_mode='single', idx=0,
             train_score_callback: Callable[[int, torch.Tensor], None] = None,
-            validation_score_callback: Callable[[int, torch.Tensor], None] = None, tb_writer=None, **kwargs):
+            validation_score_callback: Callable[[int, torch.Tensor], None] = None, tb_writer=None, progress=None, **kwargs):
         r""" Fits a VampNet on data.
 
         Parameters
@@ -1435,6 +1511,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
         self : VAMPNet
             Reference to self.
         """
+        progress = handle_progress_bar(progress)
         self._step = 0        
         
         # and train
@@ -1455,7 +1532,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
         if train_mode=='all':
             
                 
-            for epoch in range(n_epochs):
+            for _ in progress(range(n_epochs), desc="Fitting CG", total=n_epochs):
                 self.optimizer_u.zero_grad()
                 self.optimizer_s.zero_grad()
                 for opt in self.cg_opt_list:
@@ -1517,7 +1594,7 @@ class DeepMSM(DLEstimatorMixin, Transformer):
                     _, S_n_val = self.slayer(v_val, C00_val, Ctt_val, C0t_val, Sigma_val, return_S=True)
                     for cg_id in range(idx):
                         _ , chi_val_t, chi_val_tau, u_n_val, S_n_val = self.cg_list[cg_id].get_cg_uS(chi_val_t, chi_val_tau, u_n_val, S_n_val, return_chi=True)
-            for epoch in range(n_epochs):
+            for _ in progress(range(n_epochs), desc="Fitting CG for single layer", total=n_epochs):
                 self.cg_opt_list[idx].zero_grad()
                 matrix_cg = self.cg_list[idx].get_cg_uS(chi_t, chi_tau, u_n, S_n, return_chi=False)[0]
                 loss_value = torch.trace(matrix_cg)
@@ -2229,11 +2306,11 @@ class DeepMSM(DLEstimatorMixin, Transformer):
 
                     param.copy_(torch.Tensor(kernel_S))
     
-    def reset_u_S(self, data_loader: torch.utils.data.DataLoader, reset_opt=False):
-        
+    def reset_u_S(self, data_loader: torch.utils.data.DataLoader, reset_opt=False, progress=None):
+        progress = handle_progress_bar(progress)
         with torch.no_grad():
             chi_t, chi_tau = [], []
-            for batch_0, batch_t in data_loader:
+            for batch_0, batch_t in progress(data_loader, desc="Resetting u_S"):
                 chi_t.append(self.forward(batch_0).detach())
                 chi_tau.append(self.forward(batch_t).detach())
             
